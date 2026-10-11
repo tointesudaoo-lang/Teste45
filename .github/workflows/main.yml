@@ -1,0 +1,297 @@
+name: Windows RDP  
+  
+on:  
+  workflow_dispatch:  
+  
+jobs:  
+  remote-windows:  
+    runs-on: windows-latest  
+    timeout-minutes: 360  
+  
+    steps:  
+  
+      # ==============================  
+      # CONFIGURAR RDP  
+      # ==============================  
+      - name: Configure RDP  
+        shell: powershell  
+        run: |  
+          Write-Host "================================"  
+          Write-Host "Configurando RDP..."  
+          Write-Host "================================"  
+  
+          Set-ItemProperty `  
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `  
+            -Name "fDenyTSConnections" `  
+            -Value 0 `  
+            -Force  
+  
+          Set-Service `  
+            -Name "TermService" `  
+            -StartupType Automatic  
+  
+          if ((Get-Service -Name "TermService").Status -ne "Running") {  
+            Start-Service -Name "TermService"  
+          }  
+  
+          Enable-NetFirewallRule `  
+            -DisplayGroup "Remote Desktop"  
+  
+          Write-Host "RDP configurado com sucesso."  
+  
+      # ==============================  
+      # CONFIGURAR USUARIO  
+      # ==============================  
+      - name: Configure runneradmin Account  
+        shell: powershell  
+        run: |  
+  
+          $Username = "runneradmin"  
+          $Password = "P@ssw0rd!"  
+  
+          Write-Host "Verificando usuário: $Username"  
+  
+          $User = Get-LocalUser `  
+            -Name $Username `  
+            -ErrorAction SilentlyContinue  
+  
+          if (!$User) {  
+            Write-Error "O usuário runneradmin não existe neste runner."  
+            exit 1  
+          }  
+  
+          $SecurePassword = ConvertTo-SecureString `  
+            $Password `  
+            -AsPlainText `  
+            -Force  
+  
+          Set-LocalUser `  
+            -Name $Username `  
+            -Password $SecurePassword  
+  
+          Enable-LocalUser `  
+            -Name $Username  
+  
+          Add-LocalGroupMember `  
+            -Group "Remote Desktop Users" `  
+            -Member $Username `  
+            -ErrorAction SilentlyContinue  
+  
+          "RDP_USER=$Username" >> $env:GITHUB_ENV  
+          "RDP_PASSWORD=$Password" >> $env:GITHUB_ENV  
+  
+          Write-Host ""  
+          Write-Host "================================"  
+          Write-Host "USUARIO: .\$Username"  
+          Write-Host "SENHA:   $Password"  
+          Write-Host "================================"  
+  
+      # ==============================  
+      # VERIFICAR USUARIO  
+      # ==============================  
+      - name: Verify User  
+        shell: powershell  
+        run: |  
+  
+          $Username = "runneradmin"  
+  
+          $User = Get-LocalUser `  
+            -Name $Username `  
+            -ErrorAction SilentlyContinue  
+  
+          if (!$User) {  
+            Write-Error "runneradmin não foi encontrado."  
+            exit 1  
+          }  
+  
+          if ($User.Enabled -ne $true) {  
+            Write-Error "runneradmin está desativado."  
+            exit 1  
+          }  
+  
+          Write-Host "Conta encontrada:"  
+          Write-Host "Nome: $($User.Name)"  
+          Write-Host "Enabled: $($User.Enabled)"  
+  
+      # ==============================  
+      # INSTALAR TAILSCALE  
+      # ==============================  
+      - name: Install Tailscale  
+        shell: powershell  
+        run: |  
+  
+          Write-Host "Instalando Tailscale..."  
+  
+          $Installer = "$env:TEMP\tailscale.msi"  
+  
+          Invoke-WebRequest `  
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `  
+            -OutFile $Installer  
+  
+          if (!(Test-Path $Installer)) {  
+            Write-Error "Falha ao baixar o Tailscale."  
+            exit 1  
+          }  
+  
+          $Process = Start-Process `  
+            -FilePath "msiexec.exe" `  
+            -ArgumentList "/i `"$Installer`" /quiet /norestart" `  
+            -Wait `  
+            -PassThru  
+  
+          if ($Process.ExitCode -ne 0) {  
+            Write-Error "Instalação do Tailscale falhou. Código: $($Process.ExitCode)"  
+            exit 1  
+          }  
+  
+          Remove-Item `  
+            $Installer `  
+            -Force `  
+            -ErrorAction SilentlyContinue  
+  
+          Write-Host "Tailscale instalado."  
+  
+      # ==============================  
+      # CONECTAR TAILSCALE  
+      # ==============================  
+      - name: Connect Tailscale  
+        shell: powershell  
+        env:  
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}  
+        run: |  
+  
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"  
+  
+          if (!(Test-Path $Tailscale)) {  
+            Write-Error "Tailscale não encontrado."  
+            exit 1  
+          }  
+  
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {  
+            Write-Error "TAILSCALE_AUTH_KEY não foi configurada nos Secrets."  
+            exit 1  
+          }  
+  
+          Write-Host "Conectando ao Tailscale..."  
+  
+          & $Tailscale up `  
+            --authkey="$env:TAILSCALE_AUTH_KEY" `  
+            --hostname="github-rdp-$env:GITHUB_RUN_ID"  
+  
+          Start-Sleep -Seconds 10  
+  
+          $IP = (& $Tailscale ip -4 2>$null).Trim()  
+  
+          if ([string]::IsNullOrWhiteSpace($IP)) {  
+            Write-Error "IP Tailscale não encontrado."  
+            exit 1  
+          }  
+  
+          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV  
+  
+          Write-Host ""  
+          Write-Host "Tailscale conectado."  
+          Write-Host "IP: $IP"  
+  
+      # ==============================  
+      # VERIFICAR PORTA RDP  
+      # ==============================  
+      - name: Verify RDP Port  
+        shell: powershell  
+        run: |  
+  
+          Write-Host "Aguardando serviço RDP..."  
+  
+          Start-Sleep -Seconds 10  
+  
+          $Service = Get-Service `  
+            -Name "TermService" `  
+            -ErrorAction SilentlyContinue  
+  
+          if (!$Service) {  
+            Write-Error "Serviço TermService não encontrado."  
+            exit 1  
+          }  
+  
+          if ($Service.Status -ne "Running") {  
+            Start-Service -Name "TermService"  
+            Start-Sleep -Seconds 5  
+          }  
+  
+          Write-Host "Serviço RDP: $((Get-Service TermService).Status)"  
+  
+          Write-Host ""  
+          Write-Host "Testando porta 3389..."  
+  
+          $Test = Test-NetConnection `  
+            -ComputerName "127.0.0.1" `  
+            -Port 3389 `  
+            -WarningAction SilentlyContinue  
+  
+          Write-Host "Porta 3389 local: $($Test.TcpTestSucceeded)"  
+  
+          if (!$Test.TcpTestSucceeded) {  
+            Write-Error "A porta 3389 não está funcionando."  
+            exit 1  
+          }  
+  
+          Write-Host "Porta 3389 funcionando."  
+  
+      # ==============================  
+      # INFORMACOES DE CONEXAO  
+      # ==============================  
+      - name: Connection Information  
+        shell: powershell  
+        run: |  
+  
+          Write-Host ""  
+          Write-Host "=============================================="  
+          Write-Host "              RDP DISPONIVEL"  
+          Write-Host "=============================================="  
+          Write-Host ""  
+          Write-Host "ENDERECO:"  
+          Write-Host "$env:TAILSCALE_IP"  
+          Write-Host ""  
+          Write-Host "USUARIO:"  
+          Write-Host ".\runneradmin"  
+          Write-Host ""  
+          Write-Host "SENHA:"  
+          Write-Host "$env:RDP_PASSWORD"  
+          Write-Host ""  
+          Write-Host "PORTA:"  
+          Write-Host "3389"  
+          Write-Host ""  
+          Write-Host "TEMPO MAXIMO DO JOB:"  
+          Write-Host "360 minutos (6 horas)"  
+          Write-Host ""  
+          Write-Host "=============================================="  
+  
+      # ==============================  
+      # MANTER JOB ATIVO  
+      # ==============================  
+      - name: Keep RDP Online  
+        shell: powershell  
+        run: |  
+  
+          Write-Host "RDP ativo."  
+          Write-Host "Usuário: .\runneradmin"  
+          Write-Host "IP: $env:TAILSCALE_IP"  
+          Write-Host "Limite do runner: 360 minutos."  
+  
+          while ($true) {  
+  
+            $RDPService = Get-Service `  
+              -Name "TermService" `  
+              -ErrorAction SilentlyContinue  
+  
+            if ($RDPService -and $RDPService.Status -ne "Running") {  
+              Write-Host "Serviço RDP parou. Tentando iniciar novamente..."  
+              Start-Service -Name "TermService"  
+            }  
+  
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP ativo."  
+  
+            Start-Sleep -Seconds 300  
+          }
+
+Consegue criar você msm ? Que funcione e que eu possa modificar
